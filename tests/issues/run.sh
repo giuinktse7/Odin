@@ -79,6 +79,17 @@ else
 	exit 1
 fi
 $ODIN check ../test_issue_6484.odin -no-entry-point $COMMON_CHECK
+$ODIN check ../test_check_build_mode_test.odin -build-mode:test -no-entry-point $COMMON_CHECK
+if [[ $($ODIN check ../test_check_build_mode_test.odin -build-mode:test -define:TEST_CHECK_EXPECT_ERROR=true -no-entry-point $COMMON_CHECK 2>&1 >/dev/null | grep -c "Too many arguments") -eq 1 ]]; then
+	echo "SUCCESSFUL 1/1"
+else
+	echo "SUCCESSFUL 0/1"
+	exit 1
+fi
+if $ODIN check ../test_check_build_mode_test.odin -build-mode:obj -no-entry-point $COMMON_CHECK >/dev/null 2>&1; then
+	echo "SUCCESSFUL 0/1"
+	exit 1
+fi
 $ODIN test ../test_issue_6753.odin $COMMON
 if [[ $($ODIN check ../test_issue_6874.odin $COMMON_CHECK 2>&1 >/dev/null | grep -c "Error:") -eq 1 ]]; then
 	echo "SUCCESSFUL 1/1"
