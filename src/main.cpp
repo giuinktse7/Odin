@@ -682,7 +682,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_KeepTempFiles,           str_lit("keep-temp-files"),           BuildFlagParam_None,    Command__does_build | Command_strip_semicolon);
 	add_flag(&build_flags, BuildFlag_Collection,              str_lit("collection"),                BuildFlagParam_String,  Command__does_check);
 	add_flag(&build_flags, BuildFlag_Define,                  str_lit("define"),                    BuildFlagParam_String,  Command__does_check, true);
-	add_flag(&build_flags, BuildFlag_BuildMode,               str_lit("build-mode"),                BuildFlagParam_String,  Command__does_build); // Commands_build is not used to allow for a better error message
+	add_flag(&build_flags, BuildFlag_BuildMode,               str_lit("build-mode"),                BuildFlagParam_String,  Command__does_build | Command_check); // Command_build is not used to allow for a better error message
 	add_flag(&build_flags, BuildFlag_KeepExecutable,          str_lit("keep-executable"),           BuildFlagParam_None,    Command__does_build | Command_test);
 	add_flag(&build_flags, BuildFlag_Target,                  str_lit("target"),                    BuildFlagParam_String,  Command__does_check);
 	add_flag(&build_flags, BuildFlag_Subtarget,               str_lit("subtarget"),                 BuildFlagParam_String,  Command__does_check);
@@ -854,7 +854,8 @@ gb_internal bool parse_build_flags(Array<String> args) {
 			if (bf.name == name) {
 				found = true;
 				found_bf = bf;
-				if ((bf.command_support & build_context.command_kind) == 0) {
+				if ((bf.command_support & build_context.command_kind) == 0 &&
+				    !(build_context.command == "check" && (bf.command_support & Command_check) != 0)) {
 					is_supported = false;
 					break;
 				}
@@ -1336,8 +1337,9 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							GB_ASSERT(value.kind == ExactValue_String);
 							String str = value.value_string;
 
-							if (build_context.command != "build") {
-								gb_printf_err("'build-mode' can only be used with the 'build' command\n");
+							bool checking_tests = build_context.command == "check" && str == "test";
+							if (build_context.command != "build" && !checking_tests) {
+								gb_printf_err("'build-mode' can only be used with the 'build' command, or with 'check' when set to 'test'\n");
 								bad_flags = true;
 								break;
 							}
@@ -2854,6 +2856,11 @@ gb_internal int print_show_help(String const arg0, String command, String option
 				print_usage_line(3, "-build-mode:asm         Builds as an assembly file.");
 				print_usage_line(3, "-build-mode:llvm-ir     Builds as an LLVM IR file.");
 				print_usage_line(3, "-build-mode:llvm        Builds as an LLVM IR file.");
+		}
+	}
+	if (command == "check") {
+		if (print_flag("-build-mode:test")) {
+			print_usage_line(2, "Type checks in test mode, including files tagged with `#+test`.");
 		}
 	}
 
