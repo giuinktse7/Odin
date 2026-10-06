@@ -891,6 +891,21 @@ struct lbAsmGenerate_amd64 : lbAsmGenerate {
 		}
 		GB_ASSERT(instr->valid_form_index >= 0);
 
+		// NOTE(bill): The descriptor-table ops (lgdt/lidt/sgdt/sidt) take an m16:32 / m16:64 pseudo-descriptor.
+		// Its size can't be carried by the memory operand and it isn't a 1/2/4/8-byte scalar,
+		// so LLVM's AT&T assembler requires an explicit mnemonic suffix to pick the form: 'q' in 64-bit mode ('l' in 32-bit).
+		switch (instr->mnemonic) {
+		case Asm_amd64::M_LGDT:
+		case Asm_amd64::M_LIDT:
+		case Asm_amd64::M_SGDT:
+		case Asm_amd64::M_SIDT:
+			if (build_context.metrics.arch == TargetArch_i386) {
+				return 'l';
+			}
+			return 'q';
+		}
+
+
 		auto forms = g_asm_amd64.encoding_forms(instr->mnemonic);
 		if (forms.count <= 1) {
 			return 0;
@@ -1219,7 +1234,7 @@ struct lbAsmGenerate_arm64 : lbAsmGenerate {
 		}
 		auto slot = form.ops[i];
 		AsmOperandKind k = g_asm_arm64.kind_from_operand_type(slot);
-		if (k != AsmOperand_Register && k != AsmOperand_Register_Or_Memory) {
+		if (k != AsmOperand_Register && k != AsmOperand_Register_Or_Memory && k != AsmOperand_RegisterShift) {
 			return 0;
 		}
 		AsmRegClass cls = g_asm_arm64.operand_type_reg_class(slot);
@@ -1542,6 +1557,102 @@ struct lbAsmGenerate_arm64 : lbAsmGenerate {
 				         expr_to_string(base_op));
 				break;
 			}
+		case_end;
+		case_ast_node(be, BinaryExpr, op);
+			// The register takes the slot's own w/x modifier (arm64_slot_reg_modifier now
+			// covers RegisterShift), so recurse for it, then append the shift modifier.
+			this->write_operand(op_number, be->left, flags & ~WriteOperandFlag_PrintPrefixes);
+
+			// Shifted/scaled register operand -> `reg, <shift> #n`. `<<`=lsl, `>>`=lsr,
+			// and `*` is lsl by log2 of the (power-of-two) multiplier. Only produced on
+			// ARM64 (the checker rejects it elsewhere) and only for a *_SHIFTED slot.
+			char const *shift_name = nullptr;
+			switch (be->op.kind) {
+			case Token_Shl:
+			case Token_Mul:
+				shift_name = "lsl";
+				break;
+			case Token_Shr:
+				{
+					// `>>` is arithmetic on a signed operand, logical on an unsigned one.
+					Type *t = be->left->tav.type;
+					bool is_signed = t != nullptr && is_type_integer(t) && !is_type_unsigned(t);
+					shift_name = is_signed ? "asr" : "lsr";
+				}
+				break;
+			default:
+				GB_PANIC("asm: unexpected register-shift operator '%.*s'", LIT(be->op.string));
+				break;
+			}
+
+
+			i64 raw = 0;
+
+			Ast *amount = be->right;
+			if (amount->tav.mode == Addressing_Constant) {
+				raw = exact_value_to_i64(exact_value_to_integer(amount->tav.value));
+			} else {
+				Entity *e  = entity_of_node(amount);
+				auto   *ed = entity_op(e);
+				if (ed == nullptr || ed->kind != AsmTemplateEntityDecl_Immediate) {
+					error(amount, "A register shift amount must be a constant or $-immediate");
+					break;
+				}
+				GB_ASSERT(ed->param_index >= 0);
+				lbValue v = (*this->curr_args)[ed->param_index];
+				GB_ASSERT_MSG(LLVMIsAConstantInt(v.value),
+				              "asm: register shift amount '%.*s' is not a constant",
+				              LIT(ed->entity->token.string));
+				raw = cast(i64)LLVMConstIntGetSExtValue(v.value);
+			}
+
+			i64 shift = 0;
+
+			if (be->op.kind == Token_Mul) {
+				// `reg * k` is a multiplier: k must be a positive power of two, and the
+				// encoded shift is log2(k).  reg * 2^s == reg, lsl #s
+				if (raw <= 0 || !is_power_of_two(raw)) {
+					error(amount, "A register scale using '*' must be a positive power of two, got %lld", cast(long long)raw);
+					break;
+				}
+				shift = 0;
+				for (i64 v = raw; v > 1; v >>= 1) {
+					shift++;
+				}
+			} else {
+				// `<<` / `>>`: the amount is already the shift count.
+				if (raw < 0) {
+					error(amount, "A register shift amount cannot be negative, got %lld", cast(long long)raw);
+					break;
+				}
+				shift = raw;
+			}
+
+			i64 reg_bits = 0;
+			if (instr != nullptr && instr->valid_form_index >= 0) {
+				auto forms = g_asm_arm64.encoding_forms(instr->mnemonic);
+				if (instr->valid_form_index < forms.count) {
+					auto slot = forms[instr->valid_form_index].ops[opi];
+					reg_bits  = g_asm_arm64.operand_type_bit_width(slot);
+				}
+			}
+			GB_ASSERT_MSG(reg_bits == 32 || reg_bits == 64,
+			              "asm: shifted register slot has unexpected width %lld", cast(long long)reg_bits);
+
+			i64 max_shift = reg_bits - 1;
+
+			if (shift > max_shift) {
+				if (be->op.kind == Token_Mul) {
+					error(amount, "Multiply amount %lld is too large; the maximum shift is %lld bits for a %lld-bit register",
+					      cast(long long)raw, cast(long long)max_shift, cast(long long)reg_bits);
+				} else {
+					error(amount, "Shift amount %lld exceeds the maximum of %lld for a %lld-bit register",
+					      cast(long long)shift, cast(long long)max_shift, cast(long long)reg_bits);
+				}
+				break;
+			}
+
+			asm_string = gb_string_append_fmt(asm_string, ", %s #%lld", shift_name, cast(long long)shift);
 		case_end;
 		default:
 			GB_PANIC("TODO(bill): write_operand for '%s'", expr_to_string(op));
