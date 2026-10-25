@@ -123,6 +123,7 @@ struct AttributeContext {
 	String  link_section;
 	String  linkage;
 	isize   init_expr_list_count;
+	i64     align;
 	String  thread_local_model;
 	String  deprecated_message;
 	String  warning_message;
@@ -166,6 +167,11 @@ struct AttributeContext {
 
 	u64 fast_math_flags;
 
+	u8     futex; // ProcedureFutex
+	String futex_parameter;
+	u8     synchronizes;        // OdinAtomicMemoryOrder, .Relaxed when it synchronizes nothing
+	bool   synchronizes_shared; // only reads, as a shared lock does
+
 	bool   raddbg_type_view;
 	String raddbg_type_view_string;
 };
@@ -203,13 +209,40 @@ struct VariadicReuseData {
 	i64 max_count;
 };
 
-// DeclInfo is used to store information of certain declarations to allow for "any order" usage
-struct DeclInfo {
-	DeclInfo *    parent; // NOTE(bill): only used for procedure literals at the moment
-
+struct ProcDeclInfo {
 	BlockingMutex next_mutex; // for `nested_to_check`
 
 	Array<struct ProcInfo *> nested_to_check; // nested procedures to check once this body is checked
+	Array<Entity *> asm_templates_to_check;   // the asm templates whose bodies are checked once this body is checked, see `check_asm_template_body_later`
+
+	Type *  gen_proc_type; // Precalculated
+	Entity *para_poly_original;
+	std::atomic<struct ProcInfo *> gen_proc_info; // a specialization's body, queued for checking when it is first used
+	struct ProcInfo *proc_info; // its body, once checked
+
+	BlockingMutex                 proc_checked_mutex;
+	std::atomic<ProcCheckedState> proc_checked_state;
+	std::atomic<bool>             defer_use_checked;
+	isize                         defer_used;
+
+	i32               escape_index; // of its body, see `EscapeGraph`
+	std::atomic<bool> escapes_analysed;
+	Slice<struct EscapeFlow> escape_flows; // see `escape_call`
+
+	Array<BlockLabel> labels;
+
+	Array<VariadicReuseData> variadic_reuses;
+	i64 variadic_reuse_max_bytes;
+	i64 variadic_reuse_max_align;
+
+	// NOTE(bill): this is to prevent a race condition since these procedure literals can be created anywhere at any time
+	std::atomic<struct lbModule *> code_gen_module;
+	std::atomic<String *>          local_proc_name; // the backend's name for a procedure declared in a procedure body
+};
+
+// DeclInfo is used to store information of certain declarations to allow for "any order" usage
+struct DeclInfo {
+	DeclInfo *    parent; // NOTE(bill): only used for procedure literals at the moment
 
 	Scope *       scope;
 
@@ -219,20 +252,14 @@ struct DeclInfo {
 	Ast *         type_expr;
 	Ast *         init_expr;
 	Array<Ast *>  attributes;
-	Ast *         proc_lit;      // Ast_ProcLit
-	Type *        gen_proc_type; // Precalculated
+	Ast *         proc_lit; // Ast_ProcLit
+	ProcDeclInfo *proc;     // set with `proc_lit`, see `init_decl_info_proc`
 
-	Entity *     para_poly_original;
-	std::atomic<struct ProcInfo *> gen_proc_info; // a specialization's body, queued for checking when it is first used
+	bool              is_using;
+	bool              foreign_require_results;
+	std::atomic<bool> where_clauses_evaluated;
 
-	bool                          is_using;
-	bool                          foreign_require_results;
-	std::atomic<bool>             where_clauses_evaluated;
-	std::atomic<ProcCheckedState> proc_checked_state;
-
-	BlockingMutex     proc_checked_mutex;
-	isize             defer_used;
-	std::atomic<bool> defer_use_checked;
+	i32 scope_index;
 
 	CommentGroup *comment;
 	CommentGroup *docs;
@@ -242,20 +269,6 @@ struct DeclInfo {
 
 	RwMutex type_info_deps_mutex;
 	TypeSet type_info_deps;
-
-	BlockingMutex type_and_value_mutex;
-
-	Array<BlockLabel> labels;
-
-	i32 scope_index;
-
-	Array<VariadicReuseData> variadic_reuses;
-	i64 variadic_reuse_max_bytes;
-	i64 variadic_reuse_max_align;
-
-	// NOTE(bill): this is to prevent a race condition since these procedure literals can be created anywhere at any time
-	std::atomic<struct lbModule *> code_gen_module;
-	std::atomic<String *>          local_proc_name; // the backend's name for a procedure declared in a procedure body
 };
 
 // ProcInfo stores the information needed for checking a procedure
@@ -268,6 +281,24 @@ struct ProcInfo {
 	u64       tags;
 	bool      generated_from_polymorphic;
 	Ast *     poly_def_node;
+	ProcInfo *poly_parent; // the instantiation whose body this was instantiated or declared in, see `error_out_instantiations`
+};
+
+struct CheckedCall {
+	DeclInfo *caller;
+	Entity *  callee;
+};
+
+struct CheckedAtomic {
+	Ast *          call;
+	DeclInfo *     decl;
+	i32            id;    // BuiltinProcId, of an atomic or volatile intrinsic
+	u8             futex; // ProcedureFutex, or of a call to a procedure with `@(futex=...)`
+};
+
+struct CheckedAddress {
+	Ast *   node;     // `&x`, or what is sliced or iterated by reference
+	Entity *location; // see `check_atomic_location`
 };
 
 
@@ -294,11 +325,10 @@ struct ScopeMapSlot {
 	Entity *value;
 };
 
-enum { SCOPE_MAP_INLINE_CAP = 16 };
+enum { SCOPE_MAP_MIN_CAP = 4 };
 
+// NOTE(bill): Most scopes declare nothing; the table is only allocated on the first insert
 struct ScopeMap {
-	InternedString  inline_keys [SCOPE_MAP_INLINE_CAP];
-	ScopeMapSlot    inline_slots[SCOPE_MAP_INLINE_CAP];
 	InternedString *keys;
 	ScopeMapSlot *  slots;
 	u32             count;
@@ -307,12 +337,6 @@ struct ScopeMap {
 
 gb_internal gb_inline u32 scope_map_max_load(u32 cap) {
 	return cap - (cap>>2); // 75%
-}
-
-gb_internal gb_inline void scope_map_init(ScopeMap *m) {
-	m->cap = SCOPE_MAP_INLINE_CAP;
-	m->slots = m->inline_slots;
-	m->keys = m->inline_keys;
 }
 
 
@@ -368,7 +392,7 @@ gb_internal gb_inline void scope_map_allocate_entries(u32 cap, InternedString **
 
 
 gb_internal void scope_map_grow(ScopeMap *m) {
-	u32 new_cap = m->cap << 1;
+	u32 new_cap = gb_max(m->cap << 1, cast(u32)SCOPE_MAP_MIN_CAP);
 	u32 new_mask = new_cap - 1;
 
 	InternedString *new_keys;
@@ -390,11 +414,11 @@ gb_internal void scope_map_grow(ScopeMap *m) {
 }
 
 gb_internal void scope_map_reserve(ScopeMap *m, isize capacity) {
-	if (m->slots == nullptr) {
-		scope_map_init(m);
+	if (capacity <= 0) {
+		return;
 	}
-	u32 new_cap = next_pow2_u32(cast(u32)capacity);
-	if (m->cap < new_cap && new_cap > SCOPE_MAP_INLINE_CAP) {
+	u32 new_cap = gb_max(next_pow2_u32(cast(u32)capacity), cast(u32)SCOPE_MAP_MIN_CAP);
+	if (m->cap < new_cap) {
 		scope_map_allocate_entries(new_cap, &m->keys, &m->slots);
 		m->cap   = new_cap;
 	}
@@ -403,9 +427,6 @@ gb_internal void scope_map_reserve(ScopeMap *m, isize capacity) {
 
 
 gb_internal Entity *scope_map_insert(ScopeMap *m, InternedString key, u32 hash, Entity *value) {
-	if (m->slots == nullptr) {
-		scope_map_init(m);
-	}
 	if (m->count >= scope_map_max_load(m->cap)) {
 		scope_map_grow(m);
 	}
@@ -454,6 +475,9 @@ gb_internal Entity *scope_map_insert(ScopeMap *m, InternedString key, u32 hash, 
 }
 
 gb_internal Entity *scope_map_get(ScopeMap *m, InternedString key, u32 hash) {
+	if (m->count == 0) {
+		return nullptr;
+	}
 	u32 mask = m->cap-1;
 	u32 pos = hash & mask;
 	u32 dist = 0;
@@ -593,7 +617,6 @@ struct Scope {
 
 	RwMutex mutex;
 	ScopeMap elements;
-	PtrSet<Scope *> imported;
 	PtrMap<u64, struct GlobalDeclSource *> *placeholders; // multi-map; names a global 'when' or 'foreign' block may declare, until all are resolved
 
 	DeclInfo *decl_info;
@@ -668,7 +691,7 @@ struct UntypedExprInfo {
 	ExprInfo *info;
 };
 
-typedef PtrMap<Ast *, ExprInfo *> UntypedExprInfoMap; 
+typedef PtrMap<Ast *, ExprInfo *> UntypedExprInfoMap;
 
 enum ObjcMsgKind : u32 {
 	ObjcMsg_normal,
@@ -719,10 +742,37 @@ struct LoadDirectoryCache {
 };
 
 
+struct PolyProcLookupOperand {
+	Type *         type;
+	ExactValue     value; // only for a `$` parameter
+	Entity *       proc_group;
+	BuiltinProcId  builtin_id;
+	AddressingMode mode;
+	bool           has_expr;
+};
+
+struct PolyProcLookup {
+	u64                          hash;
+	Type *                       dst;
+	Slice<PolyProcLookupOperand> operands;
+	Entity *                     result; // nullptr if it failed as a procedure group candidate
+	Slice<Entity *>              deps;
+	Slice<Type *>                type_info_deps;
+};
+
 struct GenProcsData {
-	Array<Entity *> procs;
-	Array<u64>      hashes; // `proc_type_identity_hash` of each of `procs`
-	RwMutex         mutex;
+	Array<Entity *>        procs;
+	Array<u64>             hashes; // `proc_type_identity_hash` of each of `procs`
+	Array<PolyProcLookup>  lookups;
+	RwMutex                mutex;
+};
+
+struct PolyProcDepCapture {
+	PolyProcDepCapture *parent;
+	DeclInfo *          decl;
+	Array<Entity *>     deps;
+	Array<Type *>       type_info_deps;
+	bool                unreplayable; // the check did more to `decl` than add dependencies
 };
 
 struct GenTypesData {
@@ -744,6 +794,23 @@ struct Defineable {
 struct RaddbgTypeView {
 	Type * type;
 	String view;
+};
+
+struct SemanticIdent {
+	Entity *entity;
+	i32     file_id;
+	i32     offset;
+	bool    definition;
+};
+
+struct SemanticWhen {
+	AstWhenStmt *ws;
+	bool         taken;
+};
+
+struct SemanticAttributes {
+	Entity *             entity;
+	Array<Ast *> const * attributes;
 };
 
 // CheckerInfo stores all the symbol information for a type-checked program
@@ -785,8 +852,6 @@ struct CheckerInfo {
 	                                   // as it needs to be iterated across afterwards
 	BlockingMutex builtin_mutex;
 
-	BlockingMutex type_and_value_mutex;
-
 	RecursiveMutex lazy_mutex; // for adding checked lazy entities to `entities`
 
 
@@ -802,6 +867,12 @@ struct CheckerInfo {
 
 	PerThreadArray<Entity *> definition_queue;
 	PerThreadArray<Entity *> entity_queue;
+
+	// `-export-semantics` related stuff
+	PerThreadArray<SemanticIdent>      semantic_ident_queue;
+	PerThreadArray<SemanticWhen>       semantic_when_queue;
+	PerThreadArray<SemanticAttributes> semantic_attributes_queue;
+
 	bool                     entities_by_file; // until gathered, see `check_add_entities_from_files`
 	std::atomic<u64>         entities_without_file; // for their `order_in_src`
 	MPSCQueue<Entity *> required_global_variable_queue;
@@ -830,6 +901,12 @@ struct CheckerInfo {
 
 	MPSCQueue<ProcInfo *> all_procedures_queue;
 	Array<ProcInfo *> all_procedures;
+
+	PerThreadArray<ProcInfo *>   checked_bodies_queue; // for `check_escapes`
+	PerThreadArray<CheckedCall>  checked_calls_queue;  // for `check_escapes`
+
+	PerThreadArray<CheckedAtomic>  checked_atomics_queue;   // for `check_atomics`
+	PerThreadArray<CheckedAddress> checked_addresses_queue; // for `check_atomics`, what has its address taken, by `&` or otherwise
 
 	BlockingMutex instrumentation_mutex;
 	Entity *instrumentation_enter_entity;
@@ -867,6 +944,8 @@ struct CheckerContext {
 	bool           in_proc_sig;
 	ForeignContext foreign_context;
 
+	Array<Entity *> *asm_templates_to_check; // of the procedure body being checked, see `check_asm_template_body_later`
+
 	CheckerTypePath *type_path;
 	isize            type_level;
 
@@ -878,6 +957,7 @@ struct CheckerContext {
 	u32        stmt_flags;
 	bool       in_enum_type;
 	bool       in_proc_group;
+	bool       in_proc_group_decl;
 	bool       in_procedure_of;
 	bool       allow_polymorphic_types;
 	bool       disallow_polymorphic_return_types; // NOTE(zen3ger): no poly type decl in return types
@@ -894,6 +974,9 @@ struct CheckerContext {
 
 	Ast *assignment_lhs_hint;
 	Ast *asm_template_hint;
+	Ast *call_proc_hint; // the callee of the call being checked
+
+	PolyProcDepCapture *poly_dep_capture;
 };
 
 gb_internal u64 check_vet_flags(CheckerContext *c);
@@ -910,6 +993,9 @@ struct Checker {
 	MPSCQueue<Entity *> procs_with_objc_context_provider_to_check;
 	BlockingMutex     procs_to_check_mutex;
 	Array<ProcInfo *> procs_to_check;
+
+	BlockingMutex     asm_templates_to_check_mutex;
+	Array<Entity *>   asm_templates_to_check; // those not within a procedure body, see `check_asm_template_body_later`
 
 
 	PerThreadArray<UntypedExprInfo> global_untyped_queue;
@@ -936,6 +1022,7 @@ gb_internal isize        type_info_index        (CheckerInfo *info, TypeInfoPair
 
 // Will return nullptr if not found
 gb_internal Entity *entity_of_node(Ast *expr);
+gb_internal Entity *check_atomic_location(Ast *expr);
 
 
 // gb_internal Entity *scope_lookup_current(Scope *s, String const &name, u32 hash=0);
@@ -959,8 +1046,15 @@ gb_internal void check_add_foreign_import_decl(CheckerContext *c, Ast *decl);
 gb_internal void check_entity_decl(CheckerContext *c, Entity *e, DeclInfo *d, Type *named_type);
 gb_internal void global_group_check_edge(CheckerContext *ctx, Entity *e);
 
-// While a group of global entities is checked: its incomplete '#soa' types, completed by the same thread
-gb_thread_local Array<Type *> *global_group_soa_types;
+// Per-thread state of checking the global entities, see `check_global_group`
+struct GlobalGroupContext {
+	struct GlobalGroup *group;
+	Entity *            entity;
+	Array<Type *> *     soa_types;
+	u64                 child_ticks; // see `global_entity_timing_begin`
+};
+
+gb_global gb_thread_local GlobalGroupContext global_group_context;
 
 struct GlobalWhenTrialEntityScope {
 	struct GlobalWhenTrial *trial;
@@ -1005,3 +1099,4 @@ gb_internal GenTypesData *ensure_polymorphic_record_entity_has_gen_types(Checker
 gb_internal void init_map_internal_types(Type *type);
 
 gb_internal void check_asm_template_from_entity(CheckerContext *c, Entity *e, DeclInfo *d);
+gb_internal void check_asm_template_body_from_entity(CheckerContext *c, Entity *e);

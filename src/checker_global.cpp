@@ -40,7 +40,6 @@ gb_internal void global_import_stage_end(GlobalImportStagePart part, u64 start) 
 gb_global std::atomic<bool> in_global_entity_stage; // to tell the checks of the global stage from those during 'when' resolution
 gb_global BlockingMutex global_entity_time_mutex;
 gb_global PtrMap<Entity *, GlobalEntityTime> global_entity_times;
-gb_thread_local u64 global_entity_child_ticks;
 
 gb_internal GlobalEntityTimingFrame global_entity_timing_begin(Entity *e) {
 	GlobalEntityTimingFrame f = {};
@@ -51,8 +50,8 @@ gb_internal GlobalEntityTimingFrame global_entity_timing_begin(Entity *e) {
 		return f;
 	}
 
-	f.saved_child_ticks = global_entity_child_ticks;
-	global_entity_child_ticks = 0;
+	f.saved_child_ticks = global_group_context.child_ticks;
+	global_group_context.child_ticks = 0;
 
 	f.active = true;
 	f.start = time_stamp_time_now();
@@ -64,8 +63,8 @@ gb_internal void global_entity_timing_end(GlobalEntityTimingFrame const &f, Enti
 		return;
 	}
 	u64 total = time_stamp_time_now() - f.start;
-	u64 self  = total - gb_min(total, global_entity_child_ticks);
-	global_entity_child_ticks = f.saved_child_ticks + total;
+	u64 self  = total - gb_min(total, global_group_context.child_ticks);
+	global_group_context.child_ticks = f.saved_child_ticks + total;
 
 	bool in_global_loop = in_global_entity_stage.load(std::memory_order_relaxed);
 
@@ -168,8 +167,8 @@ gb_internal i32 syntactic_visibility(Array<Ast *> const &attributes) {
 			    elem->FieldValue.field->kind == Ast_Ident &&
 			    elem->FieldValue.field->Ident.token.string == "private") {
 				Ast *value = elem->FieldValue.value;
-				if (value != nullptr && value->tav.value.kind == ExactValue_String) {
-					return value->tav.value.value_string == "file" ? EntityVisiblity_PrivateToFile : EntityVisiblity_PrivateToPackage;
+				if (value != nullptr && value->tav.value().kind == ExactValue_String) {
+					return value->tav.value().value_string == "file" ? EntityVisiblity_PrivateToFile : EntityVisiblity_PrivateToPackage;
 				}
 				return -1;
 			}
@@ -486,6 +485,11 @@ gb_internal void resolve_global_decl_source_internal(GlobalDeclSource *src, Inte
 			ws->is_cond_determined = true;
 			ws->determined_cond = operand.value.kind == ExactValue_Bool && operand.value.value_bool;
 		}
+
+		if (build_context.export_semantics_format != SemanticsFormat_Invalid) {
+			per_thread_array_add(&ctx.info->semantic_when_queue, SemanticWhen{ws, ws->determined_cond});
+		}
+
 		if (ws->body == nullptr || ws->body->kind != Ast_BlockStmt) {
 			error(ws->cond, "Invalid body for 'when' statement");
 		} else if (ws->else_stmt != nullptr && ws->else_stmt->kind != Ast_BlockStmt && ws->else_stmt->kind != Ast_WhenStmt) {
@@ -519,12 +523,12 @@ gb_internal void resolve_global_decl_source(GlobalDeclSource *src, InternedStrin
 		return;
 	}
 	GlobalWhenTrial *trial = global_when_trial;
-	i32 mute_depth = global_error_mute_depth;
+	i32 mute_depth = global_error_context.mute_depth;
 	global_when_trial = nullptr;
-	global_error_mute_depth = 0;
+	global_error_context.mute_depth = 0;
 	resolve_global_decl_source_internal(src, needed);
 	global_when_trial = trial;
-	global_error_mute_depth = mute_depth;
+	global_error_context.mute_depth = mute_depth;
 }
 
 gb_internal Entity *force_scope_placeholders(Scope *s, InternedString name, u32 hash) {
@@ -810,8 +814,6 @@ struct GlobalGroupGraph {
 };
 
 gb_global GlobalGroupGraph global_groups;
-gb_global gb_thread_local i32      global_group_current = -1;
-gb_global gb_thread_local Entity * global_group_current_entity;
 
 struct GlobalPlaceholderHit {
 	Scope *        scope;
@@ -860,7 +862,7 @@ gb_internal void global_graph_add_ref(GlobalGraphWalk *w, Entity *e) {
 }
 
 // NOTE: names bound within the expression (parameters, fields, '$T') are also looked up globally, which at
-// worst adds an edge; only procedure bodies are skipped, as they are checked after this stage
+// worst adds an edge; only the bodies of procedures and asm templates are skipped, as they are checked after this stage
 gb_internal void global_graph_walk(GlobalGraphWalk *w, Ast *node) {
 	if (node == nullptr) {
 		return;
@@ -1074,41 +1076,8 @@ gb_internal void global_graph_walk(GlobalGraphWalk *w, Ast *node) {
 		break;
 
 	case Ast_AsmTemplate:
+		// NOTE: like a procedure literal, the rest of it is checked after this stage, see `check_asm_template_body_later`
 		global_graph_walk(w, node->AsmTemplate.signature);
-		global_graph_walk_slice(w, node->AsmTemplate.specs);
-		global_graph_walk_slice(w, node->AsmTemplate.clobbers);
-		global_graph_walk_slice(w, node->AsmTemplate.instructions);
-		break;
-	case Ast_AsmSpec:
-		global_graph_walk(w, node->AsmSpec.type);
-		global_graph_walk(w, node->AsmSpec.value);
-		for (Ast *d : node->AsmSpec.directives) {
-			global_graph_walk(w, d);
-		}
-		break;
-	case Ast_AsmClobber:
-		global_graph_walk(w, node->AsmClobber.value);
-		break;
-	case Ast_AsmInstruction:
-		global_graph_walk_slice(w, node->AsmInstruction.operands);
-		break;
-	case Ast_AsmMemoryTerm:
-		global_graph_walk(w, node->AsmMemoryTerm.operand);
-		global_graph_walk(w, node->AsmMemoryTerm.scale);
-		break;
-	case Ast_AsmMemoryOperand:
-		global_graph_walk(w, node->AsmMemoryOperand.segment_override);
-		global_graph_walk_slice(w, node->AsmMemoryOperand.terms);
-		global_graph_walk(w, node->AsmMemoryOperand.type);
-		break;
-	case Ast_AsmRegisterGroup:
-		for (Ast *r : node->AsmRegisterGroup.registers) {
-			global_graph_walk(w, r);
-		}
-		global_graph_walk(w, node->AsmRegisterGroup.type);
-		break;
-	case Ast_AsmDirective:
-		global_graph_walk_slice(w, node->AsmDirective.operands);
 		break;
 	}
 }
@@ -1519,7 +1488,7 @@ gb_internal void global_group_check_edge(CheckerContext *ctx, Entity *e) {
 		}
 	} else {
 		i32 gi = g->group_of[v];
-		if (gi == global_group_current || g->groups[gi].done.load()) {
+		if (&g->groups[gi] == global_group_context.group || g->groups[gi].done.load()) {
 			return;
 		}
 	}
@@ -1532,9 +1501,9 @@ gb_internal void global_group_check_edge(CheckerContext *ctx, Entity *e) {
 		gb_printf_err(" needs ");
 		global_graph_print_entity(e);
 		gb_printf_err(v < 0 ? ", which is not in the graph" : "");
-		if (global_group_current_entity != by) {
+		if (global_group_context.entity != by) {
 			gb_printf_err(", while checking ");
-			global_graph_print_entity(global_group_current_entity);
+			global_graph_print_entity(global_group_context.entity);
 		}
 		gb_printf_err("\n");
 	}
@@ -1549,16 +1518,16 @@ gb_internal void check_global_group(Checker *c, GlobalGroupGraph *g, i32 gi) {
 
 	UntypedExprInfoMap untyped = {};
 	auto soa_types = array_make<Type *>(heap_allocator());
-	global_group_soa_types = &soa_types;
+	global_group_context.soa_types = &soa_types;
 
-	global_group_current = gi;
+	global_group_context.group = group;
 	for (i32 k = 0; k < group->count; k++) {
 		Entity *e = g->nodes[members[k]];
 		if (e->flags & EntityFlag_Lazy) {
 			// NOTE: only checked when something uses it; the group orders it after what it names
 			continue;
 		}
-		global_group_current_entity = e;
+		global_group_context.entity = e;
 		GlobalEntityTimingFrame timing_frame = global_entity_timing_begin(e);
 		check_single_global_entity(c, e, e->decl_info, &untyped);
 		if (e->type != nullptr && is_type_typed(e->type)) {
@@ -1575,15 +1544,15 @@ gb_internal void check_global_group(Checker *c, GlobalGroupGraph *g, i32 gi) {
 	for (Type *t : soa_types) {
 		complete_soa_type(c, t, false);
 	}
-	global_group_soa_types = nullptr;
+	global_group_context.soa_types = nullptr;
 	array_free(&soa_types);
 
 	add_untyped_expressions(&c->info, &untyped);
 	map_destroy(&untyped);
 
 	group->done.store(true);
-	global_group_current = -1;
-	global_group_current_entity = nullptr;
+	global_group_context.group  = nullptr;
+	global_group_context.entity = nullptr;
 }
 
 gb_internal void build_global_group_dependents(GlobalGroupGraph *g) {
@@ -2027,8 +1996,8 @@ gb_internal bool global_when_trial_begin_entity(Entity *e, GlobalWhenTrialEntity
 		return true;
 	}
 	scope->trial = t;
-	scope->mute_depth = global_error_mute_depth;
-	global_error_mute_depth = 0;
+	scope->mute_depth = global_error_context.mute_depth;
+	global_error_context.mute_depth = 0;
 	t->real_depth += 1;
 	return true;
 }
@@ -2036,7 +2005,7 @@ gb_internal bool global_when_trial_begin_entity(Entity *e, GlobalWhenTrialEntity
 gb_internal void global_when_trial_end_entity(GlobalWhenTrialEntityScope *scope) {
 	if (scope->trial != nullptr) {
 		scope->trial->real_depth -= 1;
-		global_error_mute_depth = scope->mute_depth;
+		global_error_context.mute_depth = scope->mute_depth;
 	}
 }
 

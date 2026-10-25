@@ -411,6 +411,9 @@ bool type_writer_append_fmt(TypeWriter *w, char const *fmt, ...) {
 
 TYPE_WRITER_PROC(type_writer_string_writer_proc) {
 	gbString *s = cast(gbString *)&w->user_data;
+	if (gb_string_available_space(*s) < len) {
+		*s = gb_string_make_space_for(*s, gb_max(len, gb_string_length(*s)));
+	}
 	*s = gb_string_append_length(*s, ptr, len);
 	return true;
 }
@@ -525,7 +528,7 @@ gb_internal void write_canonical_exact_value(TypeWriter *w, ExactValue const &v)
 
 gb_internal void write_canonical_constant_expr(TypeWriter *w, Ast *expr) {
 	if (expr->tav.mode == Addressing_Constant) {
-		write_canonical_exact_value(w, expr->tav.value);
+		write_canonical_exact_value(w, expr->tav.value());
 		return;
 	}
 	gbString s = write_expr_to_string(gb_string_make(heap_allocator(), ""), expr, false);
@@ -563,11 +566,11 @@ gb_internal void write_canonical_exact_value(TypeWriter *w, ExactValue const &v)
 	}
 	if (v.kind == ExactValue_Variant && v.value_variant != nullptr) {
 		Ast *expr = v.value_variant;
-		bool is_self = expr->tav.value.kind == ExactValue_Variant && expr->tav.value.value_variant == expr;
+		bool is_self = expr->tav.value().kind == ExactValue_Variant && expr->tav.value().value_variant == expr;
 		if (expr->tav.mode == Addressing_Constant && !is_self) {
 			write_type_to_canonical_string(w, expr->tav.type);
 			type_writer_appendc(w, "=");
-			write_canonical_exact_value(w, expr->tav.value);
+			write_canonical_exact_value(w, expr->tav.value());
 			return;
 		}
 	}
